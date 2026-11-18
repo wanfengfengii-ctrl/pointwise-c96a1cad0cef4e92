@@ -1,5 +1,3 @@
-from copy import copy
-from dataclasses import dataclass
 from warehouse.execution.bindings import BindingCell
 from warehouse.source.coordinates import OccurrenceCoordinate, child_coordinate
 from warehouse.expressions.errors import BindingCycleError, ErrorLocation
@@ -12,24 +10,31 @@ class _EmptySide:
 EMPTY_SIDE = _EmptySide()
 
 
-@dataclass(frozen=True)
-class ProjectionSite:
-    scope: object
-    coordinate: OccurrenceCoordinate
-    aliases: dict
-
-
 class Environment:
-    def __init__(self, scope, coordinate, root_record, aliases=None, projections=()):
+    """Per-occurrence evaluation environment.
+
+    An environment owns demand cells only for the bindings declared by its
+    own scope: every source occurrence owns independent root cells and every
+    element occurrence owns independent child cells. Descendants reach their
+    actual ancestors' cells through the parent chain, so an ancestor binding
+    is evaluated at most once per ancestor occurrence, in the ancestor's own
+    environment (its own coordinate, data and aliases), and is never
+    re-allocated per descendant. Equal-valued occurrences never share cells.
+    """
+
+    def __init__(self, scope, coordinate, root_record, aliases=None,
+                 parent=None, projections=()):
         self.scope = scope
         self.coordinate = coordinate
         self.root_record = root_record
         self.aliases = {} if aliases is None else aliases
-        self.site = ProjectionSite(scope, coordinate, self.aliases)
-        self.projections = projections + (self.site,)
-        self.bindings = {b.name: b for b in scope.row_bindings}
-        self.slots = {name: f'{scope.scope_id}:{name}' for name in self.bindings}
-        self.cells = {slot: BindingCell() for slot in self.slots.values()}
+        self.parent = parent
+        # Projection lineage: this environment and its ancestors, outermost
+        # first. Outputs evaluate per retained leaf against these actual
+        # declaration environments.
+        self.projections = projections + (self,)
+        self.bindings = {b.binding_id: b for b in scope.bindings}
+        self.cells = {binding_id: BindingCell() for binding_id in self.bindings}
 
     @classmethod
     def root(cls, scope, source, record):
@@ -38,24 +43,22 @@ class Environment:
     def child(self, scope, alias, element, index):
         coordinate = child_coordinate(self.coordinate, scope.scope_id, index)
         return Environment(scope, coordinate, self.root_record,
-                           self.aliases | {alias: element}, self.projections)
-
-    def at_projection(self, site):
-        view = copy(self)
-        view.scope = site.scope
-        view.coordinate = site.coordinate
-        view.aliases = site.aliases
-        return view
+                           self.aliases | {alias: element}, self, self.projections)
 
     def resolve_binding(self, reference, context, demand_coordinate):
         from warehouse.expressions.semantics import evaluate_expression
-        name = reference.name
-        if name not in self.bindings:
-            raise BindingCycleError(f'unknown row binding {name}')
-        binding = self.bindings[name]
-        return self.cells[self.slots[name]].demand(
-            lambda: evaluate_expression(binding.expr, self, context, demand_coordinate),
-            ErrorLocation(binding.expr.location, demand_coordinate))
+        environment = self
+        while environment is not None:
+            binding = environment.bindings.get(reference.binding_id)
+            if binding is not None:
+                # The owning environment evaluates and caches the binding;
+                # the first demander's coordinate is kept for the location.
+                return environment.cells[reference.binding_id].demand(
+                    lambda: evaluate_expression(
+                        binding.expr, environment, context, demand_coordinate),
+                    ErrorLocation(binding.expr.location, demand_coordinate))
+            environment = environment.parent
+        raise BindingCycleError(f'unknown row binding {reference.name}')
 
     def read_base(self, name):
         if name == 'root':

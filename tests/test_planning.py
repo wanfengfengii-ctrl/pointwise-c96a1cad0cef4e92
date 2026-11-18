@@ -3,7 +3,7 @@ import unittest
 from warehouse import Warehouse
 from warehouse.planning.model import PlanValidationError
 from warehouse.results.database import StorageFailure
-from samples import literal, field, ref, call, binding, expand
+from samples import literal, field, ref, call, binding, expand, operation
 
 
 class PlanTests(unittest.TestCase):
@@ -69,6 +69,48 @@ class PlanTests(unittest.TestCase):
         batch = self.w.ingest('r', [{}])
         rows = self.w.read_result(self.w.run(batch.batch_id, plan.plan_revision).run_id).rows
         self.assertEqual(rows[0].values, {'outer': 1, 'inner': 2})
+
+    def test_shadowed_names_keep_cycles_lexical(self):
+        # Regression for the binding-ownership incident: an inner binding
+        # reusing an ancestor's name shadows it lexically; references keep
+        # their declaring scope's meaning and no false cycle is reported.
+        plan = self.w.register_plan('p', {
+            'bindings': [binding('fee', ref('serial')),
+                         binding('serial', call('next_ticket'))],
+            'output': [binding('source_fee', ref('fee'))],
+            'expand': expand(field('root', 'values'), {
+                'bindings': [binding('serial',
+                                     operation('add', ref('fee'), literal(100)))],
+                'output': [binding('item_fee', ref('serial'))]})})
+        root = self.w.plans.get_revision(plan.plan_revision).compiled.root
+        self.assertEqual(root.bindings[0].expr.value.binding_id, 's0:serial')
+        child = root.expand.scope
+        self.assertEqual(child.bindings[0].expr.args[0].value.binding_id, 's0:fee')
+        self.assertEqual(child.output[0].expr.value.binding_id, 's1:serial')
+        # A descendant binding referencing an ancestor whose name it shadows
+        # is acyclic and must be accepted.
+        legal = self.w.register_plan('p', {
+            'bindings': [binding('a', ref('b')), binding('b', literal(1))],
+            'output': [binding('v', ref('a'))],
+            'expand': expand(literal([1]), {
+                'bindings': [binding('b', ref('a'))],
+                'output': [binding('w', ref('b'))]})})
+        batch = self.w.ingest('r', [{}])
+        rows = self.w.read_result(
+            self.w.run(batch.batch_id, legal.plan_revision).run_id).rows
+        self.assertEqual(rows[0].values, {'v': 1, 'w': 1})
+        # Genuine dependency cycles are still rejected, with or without
+        # shadowed names elsewhere in the scope chain.
+        self.reject({'bindings': [binding('a', ref('b')), binding('b', ref('a'))],
+                     'expand': expand(literal([1]), {
+                         'bindings': [binding('a', literal(1))]})})
+        self.reject({'bindings': [binding('a', literal(1))],
+                     'expand': expand(literal([1]), {
+                         'bindings': [binding('a', ref('b')),
+                                      binding('b', ref('a'))]})})
+        self.reject({'bindings': [binding('a', ref('a'))],
+                     'expand': expand(literal([1]), {
+                         'bindings': [binding('a', literal(1))]})})
 
     def test_atomic_revision_and_snapshot(self):
         data = {'output': [binding('x', literal({'v': [1]}))]}

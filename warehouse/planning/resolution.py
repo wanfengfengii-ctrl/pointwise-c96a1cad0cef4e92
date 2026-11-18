@@ -32,29 +32,38 @@ def resolve_reference(name, table):
     current = table
     while current is not None:
         if name in current.names:
-            return BindingReference(f'{table.scope_id}:{name}', table.scope_id, name)
+            # The reference is owned by the scope that declares the name
+            # (innermost lexical match), not by the referring scope.
+            return BindingReference(f'{current.scope_id}:{name}', current.scope_id, name)
         current = current.parent
     raise PlanValidationError(f'{table.scope_id}: unknown binding {name}')
 
 
 def validate_row_layout(layout, scope_id):
-    graph = {name: [ref.name for ref in collect_binding_references(binding.expr)]
-             for name, binding in layout.items()}
+    # layout maps binding_id -> BindingDefinition for the whole scope chain.
+    # Cycle detection runs on resolved binding identities: a shadowed
+    # ancestor binding keeps its own node, so an inner declaration that
+    # reuses an ancestor's name cannot fabricate a cycle, while genuine
+    # same-scope dependency cycles are still rejected here.
+    graph = {binding_id: [ref.binding_id
+                          for ref in collect_binding_references(binding.expr)]
+             for binding_id, binding in layout.items()}
     done, active = set(), set()
 
-    def check(name):
-        if name in active:
-            raise PlanValidationError(f'binding dependency cycle at {scope_id}:{name}')
-        if name in done:
+    def check(binding_id):
+        if binding_id in active:
+            raise PlanValidationError(
+                f'binding dependency cycle at {scope_id}:{layout[binding_id].name}')
+        if binding_id in done:
             return
-        active.add(name)
-        for target in graph[name]:
+        active.add(binding_id)
+        for target in graph[binding_id]:
             check(target)
-        active.remove(name)
-        done.add(name)
+        active.remove(binding_id)
+        done.add(binding_id)
 
-    for name in graph:
-        check(name)
+    for binding_id in graph:
+        check(binding_id)
 
 
 def resolve_plan(plan):
@@ -73,7 +82,7 @@ def resolve_plan(plan):
         bindings = tuple(replace(b, expr=expression(b.expr, table),
                                  binding_id=f'{table.scope_id}:{b.name}',
                                  owner_scope=table.scope_id) for b in node.bindings)
-        layout = inherited | {binding.name: binding for binding in bindings}
+        layout = inherited | {binding.binding_id: binding for binding in bindings}
         validate_row_layout(layout, table.scope_id)
         outputs = tuple(replace(o, expr=expression(o.expr, table)) for o in node.output)
         expand = None

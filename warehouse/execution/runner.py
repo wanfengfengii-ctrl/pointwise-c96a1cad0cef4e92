@@ -40,9 +40,8 @@ class ExecutionRunner:
 
     def project_outputs(self, leaf, context):
         result = {}
-        for site in leaf.projections:
-            view = leaf.at_projection(site)
-            for output in site.scope.output:
+        for environment in leaf.projections:
+            for output in environment.scope.output:
                 result[output.name] = evaluate_expression(
-                    output.expr, view, context, leaf.coordinate)
+                    output.expr, environment, context, leaf.coordinate)
         return result

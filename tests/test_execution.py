@@ -123,3 +123,24 @@ class ExecutionTests(unittest.TestCase):
         self.check_case([{}], {'where': literal(1)})
         self.check_case([{'a': [None]}], {'expand': expand(field('root', 'a'),
             {'output': [binding('v', field('item', 'missing'))]}, mode='left')})
+
+    def test_shadowed_binding_keeps_outer_meaning(self):
+        # Regression for the binding-ownership incident: the inner serial
+        # shadows the outer one lexically, the outer fee keeps referring to
+        # the outer serial, and next_ticket is allocated once per source.
+        definition = {
+            'bindings': [binding('fee', ref('serial')),
+                         binding('serial', call('next_ticket'))],
+            'output': [binding('source_fee', ref('fee'))],
+            'expand': expand(field('root', 'values'), {
+                'bindings': [binding('serial',
+                                     operation('add', ref('fee'), literal(100)))],
+                'output': [binding('item_fee', ref('serial')),
+                           binding('value', field('item'))]})}
+        result = self.check_case([{'values': [7, 7]}, {'values': [7, 7]}], definition)
+        self.assertEqual([r['values']['source_fee'] for r in result['rows']],
+                         [1, 1, 2, 2])
+        self.assertEqual([r['values']['item_fee'] for r in result['rows']],
+                         [101, 101, 102, 102])
+        self.assertEqual([t['coordinate']['elements'] for t in result['trace']],
+                         [[], []])
